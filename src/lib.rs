@@ -1,155 +1,53 @@
-use chrono::NaiveDate;
-use serde::{Deserialize, Serialize, Serializer};
 use std::{
     collections::HashMap,
     fs::{read_dir, read_to_string, DirEntry},
-    path::PathBuf,
-    sync::mpsc::channel,
-    time::Duration,
+    path::{Path, PathBuf},
 };
 use tera::Tera;
 
 use anyhow::{Context, Result};
-use comrak::{format_html, nodes::NodeValue, parse_document, Arena, Options};
+use comrak::{
+    format_html,
+    nodes::{AstNode, NodeValue},
+    parse_document, Arena, Options,
+};
 use config::Config;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
+use types::{Content, ContentKind, Metadata, RenderedItem};
 use yaml_rust2::{Yaml, YamlLoader};
 
-pub mod config {
-    use std::{fs::File, io::BufReader, path::PathBuf};
+pub mod config;
+pub(crate) mod types;
 
-    use anyhow::{Context, Result};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct Config {
-        /// Template directory
-        pub(crate) template_glob: String,
-        /// Content description
-        pub(crate) content: PathBuf,
-        /// Output directory
-        pub(crate) output: PathBuf,
-    }
-
-    impl Config {
-        pub fn try_load(path: PathBuf) -> Result<Self> {
-            let file = File::open(path).context("Unable open the config file")?;
-            serde_json::from_reader(BufReader::new(file)).context("Unable to deserialize config")
-        }
-    }
+fn read_markdown(filepath: &Path) -> Result<String> {
+    read_to_string(filepath).context("Unable to read content of a file to string.")
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ContentKind {
-    Blog,
-}
-
-impl From<&ContentKind> for String {
-    fn from(kind: &ContentKind) -> Self {
-        match kind {
-            ContentKind::Blog => "blog",
-        }
-        .into()
-    }
-}
-
-impl TryFrom<&str> for ContentKind {
-    type Error = anyhow::Error;
-
-    fn try_from(string: &str) -> std::result::Result<Self, Self::Error> {
-        match string {
-            "blog" => Ok(Self::Blog),
-            _ => Err(anyhow::anyhow!(
-                "Unknown enum type for content kind provided ({})",
-                string
-            )),
-        }
-    }
-}
-
-fn naivedate_to_string<S>(date: &NaiveDate, serializer: S) -> Result<S::Ok, S::Error>
-where
-    S: Serializer,
-{
-    let string = date.format("%Y-%m-%d").to_string();
-    serializer.serialize_str(&string)
-}
-/// Metadata derived from the frontmatter of the post markdown
-#[derive(Debug, Serialize)]
-pub(crate) struct Metadata {
-    pub(crate) title: String,
-    #[serde(serialize_with = "naivedate_to_string")]
-    pub(crate) date: NaiveDate,
-    pub(crate) kind: ContentKind,
-}
-
-impl TryFrom<HashMap<Yaml, Yaml>> for Metadata {
-    type Error = anyhow::Error;
-
-    fn try_from(mut map: HashMap<Yaml, Yaml>) -> std::result::Result<Self, Self::Error> {
-        // Extract title
-        let title = map
-            .remove(&Yaml::String("title".to_string()))
-            .context("Unable to find title in the text metadata.")?
-            .into_string()
-            .context("The provided title in the text metadata is not a string.")?;
-        // Extract date
-        let date_string = map
-                .remove(&Yaml::String("date".to_string())).context("Unable to find date in the text metadata")?
-                .into_string().context("Unable to extract string from the date field in the text metadata, ensure it's a string")?;
-        let date = NaiveDate::parse_from_str(&date_string, "%Y-%m-%d")
-            .context("Unable to parse date for a given text file metadata field")?;
-
-        // Extract content kind
-        let kind_string = map
-                .remove(&Yaml::String("kind".to_string())).context("Unable to find blog kind in the metadata.")?
-                .into_string().context("Unable to extract string from the kind field in the metadata, ensure it's a string")?;
-        let kind = kind_string
-            .as_str()
-            .try_into()
-            .context("Unable to parse the kind from the given metadata")?;
-
-        Ok(Self { title, date, kind })
-    }
-}
-#[derive(Debug)]
-pub(crate) struct Content {
-    pub(crate) metadata: Metadata,
-    pub(crate) filename: PathBuf,
-    raw: String,
-    pub(crate) html: String,
-}
-
-impl std::fmt::Display for Content {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.raw)
-    }
-}
-
-fn try_parse_content(entry: DirEntry) -> Result<Content> {
-    // Read the markdown
-    let filepath = entry.path();
-    let content =
-        read_to_string(&filepath).context("Unable to read content of a file to string.")?;
-
-    let name = filepath
+fn get_name(filepath: &Path) -> Result<PathBuf> {
+    Ok(filepath
         .with_extension("")
         .file_name()
         .context("Unable to fetch filename for file file when parsing the filepath")?
-        .into();
+        .into())
+}
 
-    // Comrak markdown parsing init
-    let arena = Arena::new();
+fn parse_markdown<'arena, 'opt>(
+    arena: &'arena Arena<AstNode<'arena>>,
+    content: &str,
+) -> Result<(
+    &'arena comrak::arena_tree::Node<'arena, std::cell::RefCell<comrak::nodes::Ast>>,
+    Options<'opt>,
+    Metadata,
+)> {
     let mut options = Options::default();
-
     // Parse the markdown into an AST
     options.extension.front_matter_delimiter = Some(String::from("---"));
-    let root = parse_document(&arena, &content, &options);
+    let root = parse_document(arena, content, &options);
 
     // Parse the frontmatter of the AST into the metadata.
     let metadata;
+
     let front_matter = root
         .first_child()
         .context("Unable to find any children in the parsed markdown AST")?;
@@ -166,6 +64,18 @@ fn try_parse_content(entry: DirEntry) -> Result<Content> {
     } else {
         return Err(anyhow::anyhow!("Unable to find frontmatter as the first item in the markdown. Make sure to include it."));
     }
+    Ok((root, options, metadata))
+}
+
+fn try_parse_content(entry: DirEntry) -> Result<Content> {
+    // Read markdown
+    let filepath = entry.path();
+    let content = read_markdown(&filepath)?;
+    let name = get_name(&filepath)?;
+
+    // Parse Markdown
+    let arena = Arena::new();
+    let (root, options, metadata) = parse_markdown(&arena, &content)?;
 
     // Turn into HTML
     let mut html = vec![];
@@ -180,13 +90,7 @@ fn try_parse_content(entry: DirEntry) -> Result<Content> {
     })
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct RenderedItem {
-    path: PathBuf,
-    metadata: Metadata,
-}
-
-pub(crate) fn render(content: Content, config: &Config) -> Result<RenderedItem> {
+fn render(content: Content, config: &Config) -> Result<RenderedItem> {
     Ok(match content.metadata.kind {
         ContentKind::Blog => {
             let kind = PathBuf::from(String::from(&content.metadata.kind)); // blog
