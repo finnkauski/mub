@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use mub::Config;
+use mub::config::Config;
 
 
 #[derive(Parser, Debug)]
@@ -14,8 +14,5 @@ struct Cli {
 
 
 fn main() -> Result<()>{
-    let cli = Cli::parse();
-    let config = Config::try_load(cli.config)?;
-    mub::generate(config)?;
-    Ok(())
+    mub::generate(Config::try_load(Cli::parse().config)?)
 }
