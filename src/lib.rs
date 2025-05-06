@@ -136,7 +136,7 @@ pub fn generate(config: Config) -> Result<()> {
     let tera = Tera::new(&config.template_glob).context("Failed to initialize templating")?;
 
     // Main read -> render orchestration
-    let rendered = read_dir(&config.content)
+    let mut rendered = read_dir(&config.content)
         .context("Unable to read blog directory")?
         .par_bridge()
         .map(|entry| -> Result<RenderedItem> {
@@ -148,6 +148,7 @@ pub fn generate(config: Config) -> Result<()> {
                 .inspect(|_| progress.inc(1))
         })
         .collect::<Result<Vec<RenderedItem>>>()?;
+    rendered.par_sort_by_key(|rendered| rendered.metadata.date);
 
     // Render the index page.
     let mut context = tera::Context::new();
