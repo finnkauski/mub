@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone)]
@@ -42,8 +43,16 @@ impl std::fmt::Display for ContentFile {
 }
 
 /// The description for the whole page.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Serialize)]
 pub(crate) struct AvailableContent {
+    pub(crate) at: DateTime<Utc>,
     pub(crate) blogs: Vec<Blog>,
 }
+
+impl Default for AvailableContent {
+    fn default() -> Self {
+        Self { at: Utc::now(), blogs: Default::default() }
+    }
+}
+
 
