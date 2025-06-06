@@ -1,36 +1,19 @@
 use std::{
-    collections::HashMap,
     ffi::OsStr,
     fs::{read_dir, read_to_string, DirEntry},
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tera::Tera;
 
 use anyhow::{Context, Result};
 use comrak::{format_html, nodes::NodeValue, parse_document, Arena, Options};
 use config::Config;
+use minijinja::{context, Environment};
 use rayon::prelude::*;
 use types::{AvailableContent, Blog, Content, ContentFile};
 
 pub mod config;
 pub(crate) mod types;
-
-fn extract_front_matter_data<'line>(string: &'line str) -> Result<HashMap<String, String>> {
-    let parse_line = |line: &'line str| -> Option<Result<(String, String)>> {
-        if line == "---" || line.is_empty() {
-            return None;
-        };
-        Some(
-            line.split_once(":")
-                .ok_or_else(|| {
-                    anyhow::anyhow!("Unable to find `:` in the front matter line: [{line}]")
-                })
-                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())),
-        )
-    };
-    string.lines().filter_map(parse_line).collect()
-}
 
 fn handle_blog(filepath: &Path) -> Result<Content> {
     // Parse the name of the blog from it's filepath
@@ -61,7 +44,19 @@ fn handle_blog(filepath: &Path) -> Result<Content> {
 
     // Parse frontmatter metadata
     if let NodeValue::FrontMatter(ref yaml) = front_matter.data.borrow().value {
-        metadata = extract_front_matter_data(yaml).context("Failed to parse front matter data")?;
+        let parse_line = |line: &str| -> Option<Result<(String, String)>> {
+            if line == "---" || line.is_empty() {
+                return None;
+            };
+            Some(
+                line.split_once(":")
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Unable to find `:` in the front matter line: [{line}]")
+                    })
+                    .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())),
+            )
+        };
+        metadata = yaml.lines().filter_map(parse_line).collect::<Result<_>>()?;
     } else {
         return Err(anyhow::anyhow!("Unable to find frontmatter as the first item in the markdown. Make sure to include it."));
     }
@@ -102,15 +97,15 @@ fn try_parse_content(entry: DirEntry) -> Result<ContentFile> {
     Ok(ContentFile { filepath, value })
 }
 
-fn render_blogs(blogs: &[Blog], tera: Arc<Tera>, config: &Config) -> Result<()> {
+fn render_blogs(blogs: &[Blog], templates: Arc<Environment>, config: &Config) -> Result<()> {
     let res = blogs
         .iter()
         .par_bridge()
         .map(|blog| -> Result<()> {
-            let mut context = tera::Context::from_serialize(blog).context(
-                "Unable to serialize blog object into a valid context for rendering templates",
-            )?;
-            context.insert("config", config);
+            // let mut context = tera::Context::from_serialize(blog).context(
+            //     "Unable to serialize blog object into a valid context for rendering templates",
+            // )?;
+            // context.insert("config", config);
 
             let output_dir = config.output.join("blog"); // output/blog
             std::fs::create_dir_all(&output_dir)
@@ -120,8 +115,10 @@ fn render_blogs(blogs: &[Blog], tera: Arc<Tera>, config: &Config) -> Result<()> 
             let out_filepath = output_dir.join(&filename); // output/blog/post1.html
 
             // Render the template
-            let rendered = tera
-                .render("blog.html", &context)
+            let context = context!(blog => blog, ..context!(config));
+            let rendered = templates
+                .get_template("blog.html")?
+                .render(&context)
                 .context("Unable to render the blog post")?;
 
             std::fs::write(&out_filepath, rendered).context(format!(
@@ -135,16 +132,12 @@ fn render_blogs(blogs: &[Blog], tera: Arc<Tera>, config: &Config) -> Result<()> 
 }
 
 fn render(content: AvailableContent, config: &Config) -> Result<()> {
-    let tera = Arc::new(
-        Tera::new(
-            &config
-                .input
-                .join("templates")
-                .join("*.html")
-                .to_string_lossy(),
-        )
-        .context("Failed to initialize templating")?,
-    );
+    let templates = Arc::new({
+        let mut env = Environment::new();
+        let template_dir = &config.input.join("templates");
+        env.set_loader(minijinja::path_loader(template_dir));
+        env
+    });
 
     // Cleanup output directory before rendering
     if config.output.exists() {
@@ -153,15 +146,12 @@ fn render(content: AvailableContent, config: &Config) -> Result<()> {
     }
 
     // Render blogs
-    render_blogs(&content.blogs, tera.clone(), config)?;
+    render_blogs(&content.blogs, templates.clone(), config)?;
 
     // Render index
-    let mut context = tera::Context::from_serialize(content)
-        .context("Unable to create context from config for rendering index")?;
-    context.insert("config", &config);
-
-    let rendered_index = tera.render("index.html", &context)?;
-    std::fs::write(config.output.join("index.html"), rendered_index)
+    let context = context!(content, ..context!(config));
+    let rendered = templates.get_template("index.html")?.render(&context)?;
+    std::fs::write(config.output.join("index.html"), rendered)
         .context("Failed to write the rendered index page")?;
     Ok(())
 }
