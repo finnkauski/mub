@@ -10,32 +10,39 @@ use tera::Tera;
 use anyhow::{Context, Result};
 use comrak::{format_html, nodes::NodeValue, parse_document, Arena, Options};
 use config::Config;
-use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use types::{AvailableContent, Blog, Content, ContentFile};
-use yaml_rust2::{Yaml, YamlLoader};
 
 pub mod config;
 pub(crate) mod types;
 
-fn read_file(filepath: &Path) -> Result<String> {
-    read_to_string(filepath).context("Unable to read content of a file to string.")
-}
-
-fn no_extension(filepath: &Path) -> Result<PathBuf> {
-    Ok(filepath
-        .with_extension("")
-        .file_name()
-        .context("Unable to fetch filename for file file when parsing the filepath")?
-        .into())
+fn extract_front_matter_data<'line>(string: &'line str) -> Result<HashMap<String, String>> {
+    let parse_line = |line: &'line str| -> Option<Result<(String, String)>> {
+        if line == "---" || line.is_empty() {
+            return None;
+        };
+        Some(
+            line.split_once(":")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unable to find `:` in the front matter line: [{line}]")
+                })
+                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())),
+        )
+    };
+    string.lines().filter_map(parse_line).collect()
 }
 
 fn handle_blog(filepath: &Path) -> Result<Content> {
     // Parse the name of the blog from it's filepath
-    let name = no_extension(filepath)?;
+    let name: PathBuf = filepath
+        .with_extension("")
+        .file_name()
+        .context("Unable to fetch filename for file file when parsing the filepath")?
+        .into();
 
     // Read the file
-    let content = read_file(filepath)?;
+    let content =
+        read_to_string(filepath).context("Unable to read content of a file to string.")?;
 
     let arena = Arena::new();
     let mut options = Options::default();
@@ -54,22 +61,7 @@ fn handle_blog(filepath: &Path) -> Result<Content> {
 
     // Parse frontmatter metadata
     if let NodeValue::FrontMatter(ref yaml) = front_matter.data.borrow().value {
-        // Parse YAML from frontmatter
-        let yaml = &YamlLoader::load_from_str(yaml).context("Failed to parse frontmatter yaml")?[0];
-
-        if let Yaml::Hash(map) = yaml {
-            metadata = map
-                .clone()
-                .into_iter()
-                .map(|(k, v)| {
-                    k.into_string()
-                        .and_then(|k| v.into_string().map(|v| (k, v)))
-                })
-                .collect::<Option<HashMap<String, String>>>()
-                .context("Unable to parse markdownfor a blog post")?;
-        } else {
-            return Err(anyhow::anyhow!("Unable to find frontmatter as the first item in the markdown. Make sure to include it."));
-        }
+        metadata = extract_front_matter_data(yaml).context("Failed to parse front matter data")?;
     } else {
         return Err(anyhow::anyhow!("Unable to find frontmatter as the first item in the markdown. Make sure to include it."));
     }
@@ -111,10 +103,10 @@ fn try_parse_content(entry: DirEntry) -> Result<ContentFile> {
 }
 
 fn render_blogs(blogs: &[Blog], tera: Arc<Tera>, config: &Config) -> Result<()> {
-    blogs
+    let res = blogs
         .iter()
         .par_bridge()
-        .map(move |blog| -> Result<()> {
+        .map(|blog| -> Result<()> {
             let mut context = tera::Context::from_serialize(blog).context(
                 "Unable to serialize blog object into a valid context for rendering templates",
             )?;
@@ -138,13 +130,20 @@ fn render_blogs(blogs: &[Blog], tera: Arc<Tera>, config: &Config) -> Result<()> 
             ))?;
             Ok(())
         })
-        .collect::<Result<()>>()
+        .collect::<Result<()>>();
+    res
 }
 
 fn render(content: AvailableContent, config: &Config) -> Result<()> {
     let tera = Arc::new(
-        Tera::new(&config.input.join("templates").join("*.html").to_string_lossy())
-            .context("Failed to initialize templating")?,
+        Tera::new(
+            &config
+                .input
+                .join("templates")
+                .join("*.html")
+                .to_string_lossy(),
+        )
+        .context("Failed to initialize templating")?,
     );
     //   /// Template directory
     // "template_glob": "input/templates/*.html",
@@ -169,28 +168,14 @@ fn render(content: AvailableContent, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn progress_bar() -> Result<ProgressBar> {
-    let style = ProgressStyle::with_template(
-        "[{elapsed_precise}] {bar:30.cyan/blue} {pos:>2}/{len:3} {msg}",
-    )
-    .context("Failed to generate a progress bar style from a given template.")?
-    .progress_chars("=>-");
-    Ok(ProgressBar::new(0).with_style(style))
-}
-
 fn collect_content(config: &Config) -> Result<AvailableContent> {
-    // Some initialisation and prep
-    let progress = progress_bar()?;
-    progress.set_message("Loading files...");
-    let res = read_dir(config.input.join("content"))
+    read_dir(config.input.join("content"))
         .context("Unable to read blog directory")?
         .par_bridge()
-        .inspect(|_| progress.inc_length(1))
         .map(|entry| -> Result<ContentFile> {
             entry
                 .context("Unable to retrieve an entry from the directory")
                 .and_then(try_parse_content)
-                .inspect(|_| progress.inc(1))
         })
         .try_fold(
             AvailableContent::default,
@@ -207,9 +192,7 @@ fn collect_content(config: &Config) -> Result<AvailableContent> {
                 a.blogs.append(&mut b.blogs);
                 Ok(a)
             },
-        );
-    progress.finish_with_message("Files loaded.");
-    res
+        )
 }
 
 fn include_extras(config: Config) -> Result<()> {
@@ -237,13 +220,8 @@ fn include_extras(config: Config) -> Result<()> {
 }
 
 pub fn generate(config: Config) -> Result<()> {
-    println!("Config:\n\n{config}\n");
-
-    // Main read -> render orchestration
-    let content = collect_content(&config)?;
-
     // Render
-    render(content, &config)?;
+    render(collect_content(&config)?, &config)?;
 
     // Include extras
     include_extras(config)

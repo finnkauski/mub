@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt::Display, fs::File, io::BufReader, path::PathBuf};
+use std::{collections::HashMap, fmt::Display, fs::File, io::BufReader, path::{Path, PathBuf}};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,7 @@ impl Display for Config {
 }
 
 impl Config {
-    pub fn try_load(path: PathBuf) -> Result<Self> {
+    pub fn try_load<P: AsRef<Path>>(path: P) -> Result<Self> {
         let file = File::open(path).context("Unable open the config file")?;
         serde_json::from_reader(BufReader::new(file)).context("Unable to deserialize config")
     }
