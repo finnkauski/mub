@@ -321,7 +321,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "comrak",
- "lazy_static",
  "rayon",
  "serde",
  "serde_json",

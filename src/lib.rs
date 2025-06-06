@@ -145,8 +145,6 @@ fn render(content: AvailableContent, config: &Config) -> Result<()> {
         )
         .context("Failed to initialize templating")?,
     );
-    //   /// Template directory
-    // "template_glob": "input/templates/*.html",
 
     // Cleanup output directory before rendering
     if config.output.exists() {
