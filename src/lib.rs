@@ -1,19 +1,40 @@
 use std::{
+    collections::HashMap,
     ffi::OsStr,
-    fs::{read_dir, read_to_string, DirEntry},
+    fs::{read_dir, read_to_string, DirEntry, File},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use anyhow::{Context, Result};
-use comrak::{format_html, nodes::NodeValue, parse_document, Arena, Options};
 use config::Config;
 use minijinja::{context, Environment};
 use rayon::prelude::*;
-use types::{AvailableContent, Blog, Content, ContentFile};
+use types::{AvailableContent, Blog, Content, ContentFile, SearchableDoc};
 
 pub mod config;
 pub(crate) mod types;
+
+// TODO: this should be a strictly typed frontmatter
+fn parse_front_matter(front_matter: &str) -> Result<HashMap<String, String>> {
+    let parse_line = |line: &str| -> Option<Result<(String, String)>> {
+        if line == "---" || line.is_empty() {
+            return None;
+        };
+        Some(
+            line.split_once(":")
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Unable to find `:` in the front matter line: [{line}]")
+                })
+                .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())),
+        )
+    };
+    front_matter
+        .lines()
+        .filter_map(parse_line)
+        .collect::<Result<_>>()
+}
 
 fn handle_blog(filepath: &Path) -> Result<Content> {
     // Parse the name of the blog from it's filepath
@@ -24,53 +45,34 @@ fn handle_blog(filepath: &Path) -> Result<Content> {
         .into();
 
     // Read the file
-    let content =
+    let markdown =
         read_to_string(filepath).context("Unable to read content of a file to string.")?;
 
-    let arena = Arena::new();
-    let mut options = Options::default();
-    // Parse the markdown into an AST
-    options.extension.front_matter_delimiter = Some(String::from("---"));
-    let root = parse_document(&arena, &content, &options);
+    let (front_matter, markdown) = markdown
+        .split_once("---")
+        .context("Unable to find the '---' delimiter marking the end of front matter")?;
 
-    // Parse the frontmatter of the AST into the metadata.
-    let metadata;
+    let metadata = parse_front_matter(front_matter)
+        .context("Unable to extract front matter metadata for blog")?;
 
-    // Fetch frontmatter
-    let front_matter = root
-        .first_child()
-        .context("Unable to find any children in the parsed markdown AST")?;
-    front_matter.detach(); // We disconnect the front matter from the markdown itself
+    let mut html = String::new();
+    let mut text = String::new();
 
-    // Parse frontmatter metadata
-    if let NodeValue::FrontMatter(ref yaml) = front_matter.data.borrow().value {
-        let parse_line = |line: &str| -> Option<Result<(String, String)>> {
-            if line == "---" || line.is_empty() {
-                return None;
-            };
-            Some(
-                line.split_once(":")
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Unable to find `:` in the front matter line: [{line}]")
-                    })
-                    .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())),
-            )
-        };
-        metadata = yaml.lines().filter_map(parse_line).collect::<Result<_>>()?;
-    } else {
-        return Err(anyhow::anyhow!("Unable to find frontmatter as the first item in the markdown. Make sure to include it."));
-    }
-
-    // Turn into HTML
-    let mut buf = vec![];
-    format_html(root, &options, &mut buf).context("Unable to turn html syntax tree into html")?;
-    let content = String::from_utf8(buf)
-        .context("Failed to turn markdown parsing produced bytes into a valid String")?;
+    // Parse markdown
+    let parser = pulldown_cmark::Parser::new(markdown).inspect(|event| {
+        if let pulldown_cmark::Event::Text(t) = event {
+            text.push_str(t);
+            text.push(' ')
+        }
+    });
+    pulldown_cmark::html::push_html(&mut html, parser);
 
     Ok(Content::Blog(Blog {
         name,
         metadata,
-        content,
+        text,
+        html,
+        markdown: markdown.to_owned(),
     }))
 }
 
@@ -102,11 +104,6 @@ fn render_blogs(blogs: &[Blog], templates: Arc<Environment>, config: &Config) ->
         .iter()
         .par_bridge()
         .map(|blog| -> Result<()> {
-            // let mut context = tera::Context::from_serialize(blog).context(
-            //     "Unable to serialize blog object into a valid context for rendering templates",
-            // )?;
-            // context.insert("config", config);
-
             let output_dir = config.output.join("blog"); // output/blog
             std::fs::create_dir_all(&output_dir)
                 .context("Unable to create output blog directory")?;
@@ -121,7 +118,10 @@ fn render_blogs(blogs: &[Blog], templates: Arc<Environment>, config: &Config) ->
                 .render(&context)
                 .context("Unable to render the blog post")?;
 
-            std::fs::write(&out_filepath, rendered).context(format!(
+            let mut writer = BufWriter::new(
+                File::create(&out_filepath).context("Unable to create a file for a blog.")?,
+            );
+            writer.write_all(rendered.as_bytes()).context(format!(
                 "Unable to write blog file into output destination ({})",
                 out_filepath.to_string_lossy()
             ))?;
@@ -131,7 +131,7 @@ fn render_blogs(blogs: &[Blog], templates: Arc<Environment>, config: &Config) ->
     res
 }
 
-fn render(content: AvailableContent, config: &Config) -> Result<()> {
+fn render(content: &AvailableContent, config: &Config) -> Result<()> {
     let templates = Arc::new({
         let mut env = Environment::new();
         let template_dir = &config.input.join("templates");
@@ -148,11 +148,30 @@ fn render(content: AvailableContent, config: &Config) -> Result<()> {
     // Render blogs
     render_blogs(&content.blogs, templates.clone(), config)?;
 
-    // Render index
+    // Context for rendering supplamentary pages
     let context = context!(content, ..context!(config));
+
+    // Render index
     let rendered = templates.get_template("index.html")?.render(&context)?;
-    std::fs::write(config.output.join("index.html"), rendered)
+
+    let out_filepath = config.output.join("index.html");
+    let mut writer = BufWriter::new(
+        File::create(&out_filepath).context("Unable to create a file for index.html")?,
+    );
+    writer
+        .write_all(rendered.as_bytes())
         .context("Failed to write the rendered index page")?;
+
+    let rendered = templates.get_template("search.html")?.render(&context)?;
+
+    let out_filepath = config.output.join("search.html");
+    let mut writer = BufWriter::new(
+        File::create(&out_filepath).context("Unable to create a file for search.html")?,
+    );
+    writer
+        .write_all(rendered.as_bytes())
+        .context("Failed to write the rendered search page")?;
+
     Ok(())
 }
 
@@ -207,9 +226,24 @@ fn include_extras(config: Config) -> Result<()> {
     Ok(())
 }
 
+fn write_search_index(content: &AvailableContent, config: &Config) -> Result<()> {
+    let output_path = config.output.join("search-index.json");
+    let writer = BufWriter::new(File::create(&output_path).context(format!(
+        "Unable to create a file for the search index: {}",
+        output_path.display()
+    ))?);
+    let docs: Result<Vec<SearchableDoc>> = content.blogs.par_iter().map(TryFrom::try_from).collect();
+    serde_json::to_writer(writer, &docs?)?;
+    Ok(())
+}
+
 pub fn generate(config: Config) -> Result<()> {
+    let content = collect_content(&config)?;
     // Render
-    render(collect_content(&config)?, &config)?;
+    render(&content, &config)?;
+
+    // Create searchable index
+    write_search_index(&content, &config)?;
 
     // Include extras
     include_extras(config)

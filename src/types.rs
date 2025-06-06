@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
+use anyhow::Error;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
@@ -7,7 +8,28 @@ use serde::Serialize;
 pub(crate) struct Blog {
     pub(crate) name: PathBuf,
     pub(crate) metadata: HashMap<String, String>,
-    pub(crate) content: String,
+    pub(crate) html: String,
+    pub(crate) text: String,
+    pub(crate) markdown: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub(crate) struct SearchableDoc {
+    name: PathBuf,
+    title: String,
+    text: String,
+}
+
+impl TryFrom<&Blog> for SearchableDoc {
+    type Error = Error;
+
+    fn try_from(blog: &Blog) -> Result<Self, Self::Error> {
+        Ok(Self {
+            name: blog.name.clone(),
+            title: blog.metadata.get("title").ok_or_else(|| anyhow::anyhow!("Unable to find a title while creating a searchable document for the search index in blog: {}", blog.name.display()))?.to_string(),
+            text: blog.text.clone()
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -51,8 +73,9 @@ pub(crate) struct AvailableContent {
 
 impl Default for AvailableContent {
     fn default() -> Self {
-        Self { at: Utc::now(), blogs: Default::default() }
+        Self {
+            at: Utc::now(),
+            blogs: Default::default(),
+        }
     }
 }
-
-
