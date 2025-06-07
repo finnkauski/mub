@@ -239,6 +239,7 @@ fn write_search_index(content: &AvailableContent, config: &Config) -> Result<()>
 
 pub fn generate(config: Config) -> Result<()> {
     let content = collect_content(&config)?;
+
     // Render
     render(&content, &config)?;
 

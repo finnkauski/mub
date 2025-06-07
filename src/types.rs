@@ -17,6 +17,7 @@ pub(crate) struct Blog {
 pub(crate) struct SearchableDoc {
     name: PathBuf,
     title: String,
+    date: String,
     text: String,
 }
 
@@ -27,6 +28,7 @@ impl TryFrom<&Blog> for SearchableDoc {
         Ok(Self {
             name: blog.name.clone(),
             title: blog.metadata.get("title").ok_or_else(|| anyhow::anyhow!("Unable to find a title while creating a searchable document for the search index in blog: {}", blog.name.display()))?.to_string(),
+            date: blog.metadata.get("date").ok_or_else(|| anyhow::anyhow!("Unable to find a date while creating a searchable document for the search index in blog: {}", blog.name.display()))?.to_string(),
             text: blog.text.clone()
         })
     }
