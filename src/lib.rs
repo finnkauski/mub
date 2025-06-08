@@ -145,33 +145,42 @@ fn render(content: &AvailableContent, config: &Config) -> Result<()> {
             .context("Unable to remove completely the output directory")?;
     }
 
+    if config.search {
+        // Create searchable index
+        write_search_index(content, config)?;
+    }
+
     // Render blogs
     render_blogs(&content.blogs, templates.clone(), config)?;
 
     // Context for rendering supplamentary pages
     let context = context!(content, ..context!(config));
 
-    // Render index
-    let rendered = templates.get_template("index.html")?.render(&context)?;
+    for template in config.render.iter() {
+        // Render index
+        let rendered = templates.get_template(template)?.render(&context)?;
+        let out_filepath = config.output.join(template);
+        let mut writer = BufWriter::new(
+            File::create(&out_filepath)
+                .context(format!("Unable to create a file for {template}"))?,
+        );
+        writer
+            .write_all(rendered.as_bytes())
+            .context(format!("Failed to write the rendered '{template}'"))?;
+    }
 
-    let out_filepath = config.output.join("index.html");
-    let mut writer = BufWriter::new(
-        File::create(&out_filepath).context("Unable to create a file for index.html")?,
-    );
-    writer
-        .write_all(rendered.as_bytes())
-        .context("Failed to write the rendered index page")?;
+    Ok(())
+}
 
-    let rendered = templates.get_template("search.html")?.render(&context)?;
-
-    let out_filepath = config.output.join("search.html");
-    let mut writer = BufWriter::new(
-        File::create(&out_filepath).context("Unable to create a file for search.html")?,
-    );
-    writer
-        .write_all(rendered.as_bytes())
-        .context("Failed to write the rendered search page")?;
-
+fn write_search_index(content: &AvailableContent, config: &Config) -> Result<()> {
+    let output_path = config.output.join("search-index.json");
+    let writer = BufWriter::new(File::create(&output_path).context(format!(
+        "Unable to create a file for the search index: {}",
+        output_path.display()
+    ))?);
+    let docs: Result<Vec<SearchableDoc>> =
+        content.blogs.par_iter().map(TryFrom::try_from).collect();
+    serde_json::to_writer(writer, &docs?)?;
     Ok(())
 }
 
@@ -226,25 +235,11 @@ fn include_extras(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn write_search_index(content: &AvailableContent, config: &Config) -> Result<()> {
-    let output_path = config.output.join("search-index.json");
-    let writer = BufWriter::new(File::create(&output_path).context(format!(
-        "Unable to create a file for the search index: {}",
-        output_path.display()
-    ))?);
-    let docs: Result<Vec<SearchableDoc>> = content.blogs.par_iter().map(TryFrom::try_from).collect();
-    serde_json::to_writer(writer, &docs?)?;
-    Ok(())
-}
-
 pub fn generate(config: Config) -> Result<()> {
     let content = collect_content(&config)?;
 
     // Render
     render(&content, &config)?;
-
-    // Create searchable index
-    write_search_index(&content, &config)?;
 
     // Include extras
     include_extras(config)

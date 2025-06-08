@@ -9,6 +9,10 @@ pub struct Config {
     pub(crate) input: PathBuf,
     /// Output directory
     pub(crate) output: PathBuf,
+    /// Which templates to render 
+    pub(crate) render: Vec<String>,
+    /// Generate search index:
+    pub(crate) search: bool,
     /// Site global metadata
     pub(crate) site: HashMap<String, serde_json::Value>,
 }
