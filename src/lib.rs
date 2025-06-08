@@ -145,11 +145,6 @@ fn render(content: &AvailableContent, config: &Config) -> Result<()> {
             .context("Unable to remove completely the output directory")?;
     }
 
-    if config.search {
-        // Create searchable index
-        write_search_index(content, config)?;
-    }
-
     // Render blogs
     render_blogs(&content.blogs, templates.clone(), config)?;
 
@@ -167,6 +162,11 @@ fn render(content: &AvailableContent, config: &Config) -> Result<()> {
         writer
             .write_all(rendered.as_bytes())
             .context(format!("Failed to write the rendered '{template}'"))?;
+    }
+
+    if config.search {
+        // Create searchable index
+        write_search_index(content, config)?;
     }
 
     Ok(())
