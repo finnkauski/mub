@@ -1,3 +1,4 @@
+- Allow inclusion only some style files using front matter
 - Make the frontmatter a well defined type
 - Make context errors more helpful at runtime like links to files etc.
 - There could be a usecase where we look at what templates are available inside of `templates/pages/` and then 
