@@ -2,27 +2,13 @@ use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::Error;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Deserialize, Serialize,  Clone)]
-pub(crate) struct PhotoProjectDescription {
-    pub(crate) title: String,
-}
-
-
-impl TryFrom<&PhotoProject> for Post {
-    type Error = ();
-
-    fn try_from(value: &PhotoProject) -> Result<Self, Self::Error> {
-
-        todo!()
-    }
-}
+use serde::Serialize;
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct PhotoProject {
-    pub(crate) info: PhotoProjectDescription,
-    pub(crate) images: Vec<PathBuf>
+    pub post: Post,
+    pub(crate) images: Vec<String>,
+    pub(crate) image_locations: Vec<PathBuf>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -58,7 +44,7 @@ impl TryFrom<&Post> for SearchableDoc {
 #[derive(Debug)]
 pub(crate) enum PostSourceKind {
     Html,
-    Markdown
+    Markdown,
 }
 
 impl TryFrom<&str> for PostSourceKind {
@@ -68,39 +54,31 @@ impl TryFrom<&str> for PostSourceKind {
         match value {
             "md" => Ok(Self::Markdown),
             "html" => Ok(Self::Html),
-            _ => Err(anyhow::anyhow!("Unknown extension passed: {value}"))
-
+            _ => Err(anyhow::anyhow!("Unknown extension passed: {value}")),
         }
     }
 }
-
-
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum ContentKind {
     Post(Post),
-    PhotoProject(PhotoProject)
+    PhotoProject(PhotoProject),
 }
 
 impl From<&ContentKind> for String {
     fn from(kind: &ContentKind) -> Self {
         match kind {
-            ContentKind::Post(post) => {post.name.to_string_lossy().into()},
-            ContentKind::PhotoProject(project) => project.info.title.clone(),
+            ContentKind::Post(post) => post.name.to_string_lossy().into(),
+            ContentKind::PhotoProject(project) => project.post.name.to_string_lossy().into(),
         }
     }
 }
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) enum LocationData {
-    PhotoProject {
-        info: PathBuf,
-        directory: PathBuf 
-    },
-    Post {
-        filepath: PathBuf
-    }
+    PhotoProject { directory: PathBuf },
+    Post { filepath: PathBuf },
 }
 
 #[derive(Debug, Serialize)]
@@ -125,7 +103,7 @@ impl std::fmt::Display for Content {
 pub(crate) struct AvailableContent {
     pub(crate) at: DateTime<Utc>,
     pub(crate) posts: Vec<Post>,
-    pub(crate) photo_projects: Vec<PhotoProject>
+    pub(crate) photo_projects: Vec<PhotoProject>,
 }
 
 impl Default for AvailableContent {

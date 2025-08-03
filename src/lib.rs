@@ -2,8 +2,8 @@ use std::{
     collections::HashMap,
     ffi::OsStr,
     fs::{read_dir, read_to_string, DirEntry, File},
-    io::{BufReader, BufWriter, Write},
-    path::{PathBuf},
+    io::{BufWriter, Write},
+    path::PathBuf,
     sync::Arc,
 };
 
@@ -11,10 +11,14 @@ use anyhow::{Context, Result};
 use config::Config;
 use minijinja::{context, Environment};
 use rayon::prelude::*;
+use serde::Serialize;
 use types::{
-    AvailableContent, Content, ContentKind, LocationData, PhotoProject, PhotoProjectDescription,
-    Post, PostSourceKind, SearchableDoc,
+    AvailableContent, Content, ContentKind, LocationData, PhotoProject, Post, PostSourceKind,
+    SearchableDoc,
 };
+
+const POSTS_DIR: &str = "posts";
+const PHOTO_DIR: &str = "photos";
 
 pub mod config;
 pub(crate) mod types;
@@ -39,7 +43,7 @@ fn parse_front_matter(front_matter: &str) -> Result<HashMap<String, String>> {
         .collect::<Result<_>>()
 }
 
-fn try_parse_content(filepath: PathBuf) -> Result<Content> {
+fn try_parse_post(filepath: PathBuf) -> Result<Post> {
     let kind = PostSourceKind::try_from(
         filepath
             .extension()
@@ -55,7 +59,7 @@ fn try_parse_content(filepath: PathBuf) -> Result<Content> {
     )?;
 
     // Parse the name of the markdown file from it's filepath
-    let name: PathBuf = filepath
+    let mut name: PathBuf = filepath
         .with_extension("")
         .file_name()
         .context("Unable to fetch filename for file when parsing the filepath")?
@@ -71,6 +75,10 @@ fn try_parse_content(filepath: PathBuf) -> Result<Content> {
 
     let metadata = parse_front_matter(front_matter)
         .context("Unable to extract front matter metadata for a markdown file")?;
+
+    if let Some(new_name) = metadata.get("name").map(PathBuf::from) {
+        name = new_name;
+    }
 
     let raw = String::from(content);
     let mut html = raw.clone();
@@ -91,76 +99,137 @@ fn try_parse_content(filepath: PathBuf) -> Result<Content> {
         text = Some(text_in_markdown);
     }
 
-    let value = ContentKind::Post(Post {
+    Ok(Post {
         name,
         metadata,
         text,
         html,
         raw,
-    });
-
-    Ok(Content {
-        location: types::LocationData::Post { filepath },
-        value,
     })
 }
 
-fn try_parse_photo_project(entry: DirEntry) -> Result<Content> {
-    let directory = entry.path();
+fn try_parse_photo_project(directory: PathBuf) -> Result<Content> {
     assert!(
         directory.is_dir(),
         "Found a DirEntry in photo project parsing that isn't a directory"
     );
-    let mut info = directory.clone();
-    info.push("info.json");
-    let file = File::open(&info).context("Unable open a project info file")?;
-    let project_info: PhotoProjectDescription = serde_json::from_reader(BufReader::new(file))
-        .context("Unable to deserialize project info file")?;
+    // NOTE(art): assumes all projects are written in html
+    // TODO(art): should support both html and markdown
+    let mut content_file = directory.clone();
+    content_file.push("post.html");
+
+    let post = try_parse_post(content_file)?;
+
+    let image_locations = read_dir(&directory)
+        .context("Unable to read images in project")?
+        .par_bridge()
+        .filter_map(|entry: Result<DirEntry, _>| -> Option<PathBuf> {
+            let entry = entry.ok()?;
+            let extension = entry
+                .path()
+                .extension()
+                .map(|ext| ext.to_string_lossy().to_string());
+            if let Some("jpg") = extension.map(|s| s.to_lowercase()).as_deref() {
+                return Some(entry.path());
+            }
+            None
+        })
+        .try_fold(Vec::new, |mut acc, image| -> Result<Vec<PathBuf>> {
+            acc.push(image);
+            Ok(acc)
+        })
+        .try_reduce(Vec::new, |mut a, mut b| -> Result<Vec<PathBuf>> {
+            a.append(&mut b);
+            Ok(a)
+        })?;
+
+    let images = image_locations.par_iter().map(|p| -> Result<String> {
+        p.file_name()
+            .context("Unable to produce file name")
+            .map( |os_str| os_str.to_string_lossy().to_string() )
+    }).collect::<Result<Vec<String>>>()?;
 
     Ok(Content {
-        location: LocationData::PhotoProject { info, directory },
+        location: LocationData::PhotoProject { directory },
         value: ContentKind::PhotoProject(PhotoProject {
-            info: project_info,
-            images: Vec::new(),
+            post,
+            images,
+            image_locations,
         }),
     })
 }
 
+fn render_post<S>(post: &Post, templates: Arc<Environment>, config: &Config, data: S) -> Result<()>
+where
+    S: Serialize,
+{
+    // Create Posts directory
+    let output_dir = config.output.join(POSTS_DIR); // output/posts
+    std::fs::create_dir_all(&output_dir).context("Unable to create post output directory")?;
+
+    let out_name = post.name.with_extension("html");
+
+    let out_filepath = output_dir.join(&out_name); // output/pages/post1.html
+
+    // Render the template
+    let context = context!(data => data, ..context!(config));
+    let template = post
+        .metadata
+        .get("template")
+        .cloned()
+        .unwrap_or("post.html".into());
+    let rendered = templates
+        .get_template(&template)?
+        .render(&context)
+        .context("Unable to render the post")?;
+
+    let mut writer =
+        BufWriter::new(File::create(&out_filepath).context("Unable to create a file for a post.")?);
+    writer.write_all(rendered.as_bytes()).context(format!(
+        "Unable to write post file into output destination ({})",
+        out_filepath.to_string_lossy()
+    ))?;
+    Ok(())
+}
+
 fn render_posts(posts: &[Post], templates: Arc<Environment>, config: &Config) -> Result<()> {
-    let res = posts
+    posts
         .iter()
         .par_bridge()
-        .map(|post| -> Result<()> {
-            let output_dir = config.output.join("posts"); // output/posts
-            std::fs::create_dir_all(&output_dir)
-                .context("Unable to create output pages directory")?;
+        .map(|post| render_post(post, templates.clone(), config, post))
+        .collect::<Result<()>>()
+}
 
-            let filename = post.name.with_extension("html"); // post1.html
-            let out_filepath = output_dir.join(&filename); // output/pages/post1.html
+fn render_photo_projects(
+    photo_projects: &[PhotoProject],
+    templates: Arc<Environment>,
+    config: &Config,
+) -> Result<()> {
+    // Create Photos directory output/photos
+    std::fs::create_dir_all(config.output.join(PHOTO_DIR))
+        .context("Unable to create photo output directory")?;
 
-            // Render the template
-            let context = context!(post => post, ..context!(config));
-            let template = post
-                .metadata
-                .get("template")
-                .cloned()
-                .unwrap_or("post.html".into());
-            let rendered = templates
-                .get_template(&template)?
-                .render(&context)
-                .context("Unable to render the post")?;
+    photo_projects
+        .iter()
+        .par_bridge()
+        .map(|project| -> Result<()> {
+            project
+                .image_locations
+                .par_iter()
+                .map(|src: &PathBuf| -> Result<()> {
+                    let filename = src
+                        .file_name()
+                        .context("Cannot extract file name from image")?;
 
-            let mut writer = BufWriter::new(
-                File::create(&out_filepath).context("Unable to create a file for a post.")?,
-            );
-            writer.write_all(rendered.as_bytes()).context(format!(
-                "Unable to write post file into output destination ({})",
-                out_filepath.to_string_lossy()
-            ))?;
+                    std::fs::copy(src, config.output.join(PHOTO_DIR).join(filename))
+                        .context("Unable to copy image file into output directory")?;
+                    Ok(())
+                })
+                .collect::<Result<()>>()?;
+            render_post(&project.post, templates.clone(), config, project)?;
             Ok(())
         })
-        .collect::<Result<()>>();
-    res
+        .collect::<Result<()>>()
 }
 
 fn render(content: &AvailableContent, config: &Config) -> Result<()> {
@@ -179,6 +248,9 @@ fn render(content: &AvailableContent, config: &Config) -> Result<()> {
 
     // Render posts
     render_posts(&content.posts, templates.clone(), config)?;
+
+    // Render projects
+    render_photo_projects(&content.photo_projects, templates.clone(), config)?;
 
     // Context for rendering supplamentary pages
     let context = context!(content, ..context!(config));
@@ -222,17 +294,21 @@ fn collect_content(config: &Config) -> Result<AvailableContent> {
         .par_bridge()
         .map(|entry| -> Result<Content> {
             let entry = entry.context("Unable to retrieve an entry from the directory")?;
-            let path = entry.path();
-            if path.is_file() {
-                try_parse_content(path)
+            let filepath = entry.path();
+            if filepath.is_file() {
+                let post = try_parse_post(filepath.clone())?;
+                Ok(Content {
+                    location: types::LocationData::Post { filepath },
+                    value: ContentKind::Post(post),
+                })
             } else {
-                try_parse_photo_project(entry)
+                try_parse_photo_project(filepath)
             }
         })
         .try_fold(
             AvailableContent::default,
-            |mut acc, content_file| -> Result<AvailableContent> {
-                match content_file?.value {
+            |mut acc, content| -> Result<AvailableContent> {
+                match content?.value {
                     ContentKind::Post(post) => acc.posts.push(post),
                     ContentKind::PhotoProject(project) => acc.photo_projects.push(project),
                 }
@@ -243,6 +319,7 @@ fn collect_content(config: &Config) -> Result<AvailableContent> {
             AvailableContent::default,
             |mut a, mut b| -> Result<AvailableContent> {
                 a.posts.append(&mut b.posts);
+                a.photo_projects.append(&mut b.photo_projects);
                 Ok(a)
             },
         )
