@@ -76,6 +76,12 @@ fn try_parse_post(filepath: PathBuf) -> Result<Post> {
     let metadata = parse_front_matter(front_matter)
         .context("Unable to extract front matter metadata for a markdown file")?;
 
+    // TODO: these should be well defined fields with a proper metadata backing struct
+    // to deserialize
+    let publish = metadata
+        .get("publish")
+        .and_then(|val| val.parse().ok())
+        .unwrap_or(false);
     if let Some(new_name) = metadata.get("name").map(PathBuf::from) {
         name = new_name;
     }
@@ -101,6 +107,7 @@ fn try_parse_post(filepath: PathBuf) -> Result<Post> {
 
     Ok(Post {
         name,
+        publish,
         metadata,
         text,
         html,
@@ -119,6 +126,7 @@ fn try_parse_photo_project(directory: PathBuf) -> Result<Content> {
     content_file.push("post.html");
 
     let post = try_parse_post(content_file)?;
+    let publish = post.publish;
 
     let image_locations = read_dir(&directory)
         .context("Unable to read images in project")?
@@ -143,16 +151,20 @@ fn try_parse_photo_project(directory: PathBuf) -> Result<Content> {
             Ok(a)
         })?;
 
-    let images = image_locations.par_iter().map(|p| -> Result<String> {
-        p.file_name()
-            .context("Unable to produce file name")
-            .map( |os_str| os_str.to_string_lossy().to_string() )
-    }).collect::<Result<Vec<String>>>()?;
+    let images = image_locations
+        .par_iter()
+        .map(|p| -> Result<String> {
+            p.file_name()
+                .context("Unable to produce file name")
+                .map(|os_str| os_str.to_string_lossy().to_string())
+        })
+        .collect::<Result<Vec<String>>>()?;
 
     Ok(Content {
         location: LocationData::PhotoProject { directory },
         value: ContentKind::PhotoProject(PhotoProject {
             post,
+            publish,
             images,
             image_locations,
         }),
@@ -196,6 +208,7 @@ fn render_posts(posts: &[Post], templates: Arc<Environment>, config: &Config) ->
     posts
         .iter()
         .par_bridge()
+        .filter(|post| post.publish)
         .map(|post| render_post(post, templates.clone(), config, post))
         .collect::<Result<()>>()
 }
@@ -212,6 +225,7 @@ fn render_photo_projects(
     photo_projects
         .iter()
         .par_bridge()
+        .filter(|project| project.publish)
         .map(|project| -> Result<()> {
             project
                 .image_locations
@@ -282,9 +296,21 @@ fn write_search_index(content: &AvailableContent, config: &Config) -> Result<()>
         "Unable to create a file for the search index: {}",
         output_path.display()
     ))?);
-    let docs: Result<Vec<SearchableDoc>> =
-        content.posts.par_iter().map(TryFrom::try_from).collect();
-    serde_json::to_writer(writer, &docs?)?;
+    let mut docs = content
+        .posts
+        .par_iter()
+        .filter(|p| p.publish)
+        .map(TryFrom::try_from)
+        .collect::<Result<Vec<SearchableDoc>>>()?;
+    let project_posts = content
+        .photo_projects
+        .par_iter()
+        .filter(|p| p.publish)
+        .map(|project| TryFrom::try_from(&project.post))
+        .collect::<Result<Vec<SearchableDoc>>>()?;
+
+    docs.extend(project_posts);
+    serde_json::to_writer(writer, &docs)?;
     Ok(())
 }
 

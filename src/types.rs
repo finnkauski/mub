@@ -7,6 +7,7 @@ use serde::Serialize;
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct PhotoProject {
     pub post: Post,
+    pub(crate) publish: bool,
     pub(crate) images: Vec<String>,
     pub(crate) image_locations: Vec<PathBuf>,
 }
@@ -14,6 +15,7 @@ pub(crate) struct PhotoProject {
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct Post {
     pub(crate) name: PathBuf,
+    pub(crate) publish: bool,
     pub(crate) metadata: HashMap<String, String>,
     pub(crate) raw: String,
     pub(crate) html: String,
