@@ -1,22 +1,78 @@
 use std::{collections::HashMap, path::PathBuf};
 
-use anyhow::Error;
+use anyhow::{anyhow, Context, Error, Result};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
+use crate::POSTS_DIR;
+
 #[derive(Debug, Serialize, Clone)]
-pub(crate) struct PhotoProject {
-    pub post: Post,
+pub(crate) struct Metadata {
+    pub(crate) name: String,
+    pub(crate) title: String,
+    pub(crate) template: String,
+    pub(crate) date: String,
     pub(crate) publish: bool,
-    pub(crate) images: Vec<String>,
-    pub(crate) image_locations: Vec<PathBuf>,
+    pub(crate) bare: bool,
+    pub(crate) extra: HashMap<String, String>,
+}
+
+// TODO: this should be a deserialize implementation
+// TODO: tie lifetimes here with &str
+impl TryFrom<&str> for Metadata {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let parse_line = |line: &str| -> Option<Result<(String, String)>> {
+            if line == "---" || line.is_empty() {
+                return None;
+            };
+            Some(
+                line.split_once(":")
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Unable to find `:` in the front matter line: [{line}]")
+                    })
+                    .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned())),
+            )
+        };
+        let extra = value
+            .lines()
+            .filter_map(parse_line)
+            .collect::<Result<HashMap<String, String>>>()?;
+
+        Ok(Self {
+            name: extra
+                .get("name")
+                .cloned()
+                .ok_or_else(|| anyhow!("Unable to find name in metadata"))?,
+            title: extra
+                .get("title")
+                .cloned()
+                .ok_or_else(|| anyhow!("Unable to find title in metadata"))?,
+            template: extra
+                .get("template")
+                .cloned()
+                .unwrap_or_else(|| String::from("post.html")),
+            date: extra
+                .get("date")
+                .cloned()
+                .ok_or_else(|| anyhow!("Unable to find date in metadata"))?,
+            publish: extra
+                .get("publish")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+            bare: extra
+                .get("bare")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+            extra,
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct Post {
-    pub(crate) name: PathBuf,
-    pub(crate) publish: bool,
-    pub(crate) metadata: HashMap<String, String>,
+    pub(crate) metadata: Metadata,
     pub(crate) raw: String,
     pub(crate) html: String,
     pub(crate) text: Option<String>,
@@ -24,21 +80,32 @@ pub(crate) struct Post {
 
 #[derive(Debug, Serialize, Clone)]
 pub(crate) struct SearchableDoc {
-    name: PathBuf,
+    path: PathBuf,
     title: String,
     date: String,
     text: String,
 }
 
-impl TryFrom<&Post> for SearchableDoc {
+impl TryFrom<&Content> for SearchableDoc {
     type Error = Error;
 
-    fn try_from(post: &Post) -> Result<Self, Self::Error> {
+    fn try_from(content: &Content) -> Result<Self, Self::Error> {
         Ok(Self {
-            name: post.name.clone(),
-            title: post.metadata.get("title").ok_or_else(|| anyhow::anyhow!("Unable to find a title while creating a searchable document for the search index in post: {}", post.name.display()))?.to_string(),
-            date: post.metadata.get("date").ok_or_else(|| anyhow::anyhow!("Unable to find a date while creating a searchable document for the search index in post: {}", post.name.display()))?.to_string(),
-            text: post.text.clone().unwrap_or_else(|| post.raw.to_owned()).clone()
+            path: content.location.dst.clone(),
+            title: content.post.metadata.title.clone(),
+            date: content.post.metadata.date.clone(),
+            text: content
+                .post
+                .text
+                .clone()
+                .unwrap_or_else(|| {
+                    content
+                        .post
+                        .text
+                        .clone() // TODO: clean these up
+                        .unwrap_or(content.post.raw.clone())
+                })
+                .clone(),
         })
     }
 }
@@ -62,41 +129,50 @@ impl TryFrom<&str> for PostSourceKind {
 }
 
 #[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "lowercase")]
-pub(crate) enum ContentKind {
-    Post(Post),
-    PhotoProject(PhotoProject),
+pub(crate) struct LocationData {
+   pub(crate) src: PathBuf,
+   pub(crate) dst: PathBuf,
+   pub(crate) url: PathBuf,
+   pub(crate) filename: String,
 }
 
-impl From<&ContentKind> for String {
-    fn from(kind: &ContentKind) -> Self {
-        match kind {
-            ContentKind::Post(post) => post.name.to_string_lossy().into(),
-            ContentKind::PhotoProject(project) => project.post.name.to_string_lossy().into(),
-        }
+impl LocationData {
+    pub(crate) fn for_post(filepath: PathBuf, config: &crate::config::Config) -> Result<LocationData> {
+        let filename = filepath
+            .with_extension("html")
+            .file_name()
+            .with_context(|| {
+                anyhow::anyhow!("Unable to fetch location output filename for post: {filepath:?}")
+            })?
+            .to_string_lossy()
+            .to_string();
+
+        let url = PathBuf::from(POSTS_DIR).join(&filename);
+        let dst = config.output.join(&url);
+
+        Ok(Self {
+            src: filepath,
+            dst,
+            url,
+            filename,
+        })
     }
-}
-
-#[derive(Debug, Serialize, Clone)]
-pub(crate) enum LocationData {
-    PhotoProject { directory: PathBuf },
-    Post { filepath: PathBuf },
 }
 
 #[derive(Debug, Serialize)]
 pub(crate) struct Content {
+    /// Whether any copying has to happen for this content or is it just
+    /// virtualised and presented in the context
+    pub(crate) bare: bool,
+    /// Whether this content should be visible at all
+    pub(crate) publish: bool,
     pub(crate) location: LocationData,
-    pub(crate) value: ContentKind,
+    pub(crate) post: Post,
 }
 
 impl std::fmt::Display for Content {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "[{}] ({})",
-            String::from(&self.value),
-            serde_json::to_string(&self.location).expect("Unable to convert location to string"),
-        )
+        write!(f, "[{:?}]", self.post.metadata.name,)
     }
 }
 
@@ -104,16 +180,14 @@ impl std::fmt::Display for Content {
 #[derive(Debug, Serialize)]
 pub(crate) struct AvailableContent {
     pub(crate) at: DateTime<Utc>,
-    pub(crate) posts: Vec<Post>,
-    pub(crate) photo_projects: Vec<PhotoProject>,
+    pub(crate) content: Vec<Content>,
 }
 
 impl Default for AvailableContent {
     fn default() -> Self {
         Self {
             at: Utc::now(),
-            posts: Default::default(),
-            photo_projects: Default::default(),
+            content: Default::default(),
         }
     }
 }

@@ -1,3 +1,5 @@
+- include should merge directories in the copy
+- thumbnail image specification
 - better errors
 - why are project posts with the images in one folder
 - Allow inclusion only some style files using front matter
